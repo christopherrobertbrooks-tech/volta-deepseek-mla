@@ -53,19 +53,49 @@ case 192:
     }
 ```
 
-The head-size-192 path was written for models with GQA ratio 8 or 16 — the
+The head-size-192 fast path was written for models with GQA ratio 8 or 16 — the
 source comment names MiMo-V2.5 variants. DeepSeek-V2-Lite has no GQA at all
-(16 heads, 16 KV heads, ratio 1), so it fails both gates and **there is no CUDA
-flash-attention kernel for this shape**.
-
-There is also no vector kernel available as a fallback:
+(16 heads, 16 KV heads, ratio 1), so it fails both gates and cannot use that
+path. The vector kernel is excluded too:
 
 ```c
 // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
 const bool can_use_vector_kernel = ... && Q->ne[0] != 192 && ...;
 ```
 
-Neither gate mentions compute capability. That is why both cards regress.
+Neither gate mentions compute capability, which is why both cards regress.
+
+**What it falls back to: a GPU kernel, not the CPU.** Measured during decode on
+the V100 — with `-fa 1` the process uses 1.25 CPU cores and the GPU sits at
+90% utilisation, against 1.00 cores and 97% with `-fa 0`. If 27 layers of
+attention were running on the host we would see many cores pegged and GPU
+utilisation collapse. We do not. `ggml_cuda_flash_attn_ext` also aborts outright
+on `BEST_FATTN_KERNEL_NONE`, and it does not abort, so a real CUDA kernel is
+selected.
+
+The remaining candidate is the tile kernel — `template-instances/
+fattn-tile-instance-dkq192-dv128.cu` exists for exactly this shape. That would
+make this the same family of problem as open issue **#26289**, which tunes FA
+fp16 tile configs for head sizes 40-112 on P100/V100/Blackwell and reports
+microbenchmark gains up to +53.9% on a V100. Head size 192 is outside its range
+and presumably equally untuned.
+
+**Not verified:** we have not directly observed which kernel is dispatched, only
+narrowed it by elimination. A maintainer can settle that in seconds; the
+reproducible numbers are the contribution.
+
+### Hypotheses tested and rejected
+
+Recorded because both were plausible and both were wrong:
+
+1. **"Volta-specific, matching FlashMLA's Ampere+ floor."** Rejected — the RTX
+   4070 regresses 52% too, and the gates test head dims and `gqa_ratio`, never
+   compute capability.
+2. **"The op falls back to the CPU, and the V100's narrow PCIe link makes the
+   round-trip worse."** Rejected by the CPU/GPU utilisation measurement above.
+   The V100 *is* in a degraded x4 slot (`LnkSta: Speed 8GT/s, Width x4
+   (downgraded)` against an x16-capable card, versus the 4070's full x16) — a
+   real property of this machine, but not the cause here.
 
 ## Why it still matters
 
